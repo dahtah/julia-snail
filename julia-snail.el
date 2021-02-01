@@ -105,6 +105,9 @@
 
 ;;; --- variables
 
+(defvar julia-snail-debug nil
+  "When t, show more runtime information.")
+
 (defvar-local julia-snail--process nil)
 
 ;;; TODO: Maybe this should hash by proc+reqid rather than just reqid?
@@ -276,7 +279,7 @@ MAXIMUM: max timeout, ms."
 (defun julia-snail--capture-basedir (buf)
   (julia-snail--send-to-server
     :Main
-    "normpath(joinpath(VERSION ≤ v\"0.7-\" ? JULIA_HOME : Sys.BINDIR, Base.DATAROOTDIR, \"julia\", \"base\"))"
+    "normpath(joinpath(VERSION <= v\"0.7-\" ? JULIA_HOME : Sys.BINDIR, Base.DATAROOTDIR, \"julia\", \"base\"))"
     :repl-buf buf
     :async nil))
 
@@ -434,7 +437,9 @@ nil, wait for the result and return it."
          (module-ns (julia-snail--construct-module-path module))
          (reqid (format "%04x%04x" (random (expt 16 4)) (random (expt 16 4))))
          (code-str (json-encode-string str))
-         (display-code-str (s-truncate 80 code-str))
+         (display-code-str (if julia-snail-debug
+                               code-str
+                             (s-truncate 80 code-str)))
          (msg (format "(ns = %s, reqid = \"%s\", code = %s)\n"
                       module-ns
                       reqid

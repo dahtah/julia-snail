@@ -21,27 +21,34 @@ Snail is a development environment and REPL interaction package for Julia in the
 
 ## Installation
 
-Julia versions 1.0–1.4 work. No packages need to be installed on the Julia side (other than Julia itself).
+Julia versions 1.0–1.5 work. Snail’s Julia-side dependencies will automatically be installed when it starts, and will stay out of your way using Julia’s [`LOAD_PATH` mechanism](https://docs.julialang.org/en/v1/base/constants/#Base.LOAD_PATH).
 
 On the Emacs side:
 
 1. Make sure you have Emacs 26.2 or later, compiled with module support (`--with-modules`). Check the value of `module-file-suffix`: it should be non-nil. (This is currently a default compile-time option Emacs distributed with [Homebrew](https://formulae.brew.sh/formula/emacs).)
 2. Install [libvterm](https://github.com/neovim/libvterm). It is available in [Homebrew](https://formulae.brew.sh/formula/libvterm) and [Ubuntu 19.10](https://packages.ubuntu.com/eoan/libvterm-dev), and in source form on other systems.
-3. Install [emacs-libvterm](https://github.com/akermu/emacs-libvterm) using your Emacs package manager. It is available from [MELPA](https://melpa.org/#/vterm) as `vterm`, so use something like `(package-install 'vterm)` or `(use-package vterm)`. **It is important to do this step separately from the `julia-snail` installation, as you may run into problems with the Emacs package manager and byte-compiler!**
+3. Install [emacs-libvterm](https://github.com/akermu/emacs-libvterm) using your Emacs package manager. It is available from [MELPA](https://melpa.org/#/vterm) as `vterm`, so use something like `(package-install 'vterm)` or `(use-package vterm :ensure t)`. **It is important to do this step separately from the `julia-snail` installation, as you may run into problems with the Emacs package manager and byte-compiler!**
 4. Verify that `vterm` works by running `M-x vterm` to start a shell. It should display a nice terminal buffer. You may find it useful to customize and configure `vterm`.
 5. Install `julia-snail` using your Emacs package manager (see below for a sample `use-package` invocation). It is available on [MELPA](https://melpa.org/#/julia-snail) and [MELPA Stable](https://stable.melpa.org/#/julia-snail).
 
 Optionally, install [markdown-mode](https://github.com/jrblevin/markdown-mode) to improve documentation buffer display.
+
+Because Julia supports Unicode identifiers and uses them for mathematical symbols, it is also a good idea to double-check that your Emacs is cleanly set up to handle Unicode. The article [Working with Coding Systems and Unicode in Emacs](https://masteringemacs.org/article/working-coding-systems-unicode-emacs) explains the settings (though Emacs 27 seems to do the right thing by default).
 
 
 ## Configuration
 
 ### `use-package` setup
 
-**Make sure to install vterm first!** (See the [Installation](#installation) section.)
+**Make sure to install vterm first!** (See the [Installation](#installation) section.) This (unfortunately) means that the order of `use-package` invocations below matters:
 
 ```elisp
+(use-package vterm
+  :ensure t)
+
 (use-package julia-snail
+  :ensure t
+  :requires vterm
   :hook (julia-mode . julia-snail-mode))
 ```
 
