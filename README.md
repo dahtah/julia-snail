@@ -4,11 +4,17 @@
 
 Snail is a development environment and REPL interaction package for Julia in the spirit of Common Lisp’s [SLIME](https://common-lisp.net/project/slime/) and Clojure’s [CIDER](https://cider.mx). It enables convenient and dynamic REPL-driven development.
 
+Snail works on platforms which support [libvterm](https://github.com/neovim/libvterm), which currently means Unix-like systems. It should also work on Windows using [WSL](https://docs.microsoft.com/en-us/windows/wsl/about).
+
+Refer to the [changelog](https://github.com/gcv/julia-snail/blob/master/CHANGELOG.md) for release notes.
+
 
 ## Features
 
 - **REPL display:** Snail uses [libvterm](https://github.com/neovim/libvterm) with [Emacs bindings](https://github.com/akermu/emacs-libvterm) to display Julia’s native REPL in a good terminal emulator. As a result, the REPL has good performance and far fewer display glitches than attempting to run the REPL in an Emacs-native `term.el` buffer.
 - **REPL interaction:** Snail provides a bridge between Julia code and a Julia process running in a REPL. The bridge allows Emacs to interact with and introspect the Julia image. Among other things, this allows loading entire files and individual functions into running Julia processes.
+- **Remote REPLs:** Julia sessions on remote machines work transparently with Snail using SSH and Emacs Tramp.
+- **Multimedia and plotting:** Snail can display Julia graphics in graphical Emacs instances using packages like [Plots](http://juliaplots.org) and [Gadfly](http://gadflyjl.org).
 - **Cross-referencing:** Snail is integrated with the built-in Emacs [xref](https://www.gnu.org/software/emacs/manual/html_node/emacs/Xref.html) system. When a Snail session is active, it supports jumping to definitions of functions and macros loaded in the session.
 - **Completion:** Snail is also integrated with the built-in Emacs [completion-at-point](https://www.gnu.org/software/emacs/manual/html_node/elisp/Completion-in-Buffers.html) facility. Provided it is configured with the `company-capf` backend, [company-mode](http://company-mode.github.io/) completion will also work (this should be the case by default).
 - **Parser:** Snail uses [CSTParser](https://github.com/julia-vscode/CSTParser.jl), a full-featured Julia parser, to infer the structure of source files and to enable features which require an understanding of code context, especially the module in which a particular piece of code lives. This enables awareness of the current module for completion and cross-referencing purposes.
@@ -21,7 +27,9 @@ Snail is a development environment and REPL interaction package for Julia in the
 
 ## Installation
 
-Julia versions 1.0–1.5 work. Snail’s Julia-side dependencies will automatically be installed when it starts, and will stay out of your way using Julia’s [`LOAD_PATH` mechanism](https://docs.julialang.org/en/v1/base/constants/#Base.LOAD_PATH).
+Julia versions >1.0 should all work with Snail.
+
+Snail’s Julia-side dependencies will automatically be installed when it starts, and will stay out of your way using Julia’s [`LOAD_PATH` mechanism](https://docs.julialang.org/en/v1/base/constants/#Base.LOAD_PATH).
 
 On the Emacs side:
 
@@ -77,16 +85,17 @@ However, `display-buffer` will (by default) split windows if the target buffer i
              '("\\*julia" (display-buffer-reuse-window display-buffer-same-window)))
 ```
 
-(If you like this setting, and find other Emacs packages’ splitting irritating, consider replacing the `"\\*julia"` regexp with `".*"`: this will suppress pretty much all window splits.)
-
 It is likely that most users will want the default REPL pop-up behavior to split the window vertically, but the default `split-window-sensibly` implementation only splits that way if `split-height-threshold` is smaller than the current window height. `split-height-threshold` defaults to 80 (lines), and relatively few windows will be that tall. Therefore, consider adding something like the following to your configuration:
 
 ```elisp
-(setq split-height-threshold 15)
+(customize-set-variable 'split-height-threshold 15)
 ```
 
 
 ## Usage
+
+The following describes basic Snail functionality. Refer to the [Snail project wiki](https://github.com/gcv/julia-snail/wiki) for additional information, including a [Tips and Tricks](https://github.com/gcv/julia-snail/wiki/Tips-and-Tricks) section.
+
 
 ### Basics
 
@@ -121,14 +130,21 @@ The `julia-snail-mode` minor mode provides a key binding map (`julia-snail-mode-
 
 Several commands include the note “in the current module”. This means the Julia parser will determine the enclosing `module...end` statements, and run the relevant code in that module. If the module has already been loaded, this means its global variables and functions will be available.
 
-In addition, most `xref` commands are available (except `xref-find-references`). `xref-find-definitions`, by default bound to `M-.`, does a decent job of jumping to function and macro definitions. Cross-reference commands are current-module aware.
+In addition, most `xref` commands are available (except `xref-find-references`). `xref-find-definitions`, by default bound to `M-.`, does a decent job of jumping to function and macro definitions. Cross-reference commands are current-module aware where it makes sense.
 
 Completion also works. Emacs built-in completion features, as well as `company-complete`, will do a reasonable job of finding the right completions in the context of the current module (though will not pick up local variables). Completion is current-module aware.
 
 
+### Multiple Julia versions
+
+The `julia-snail-executable` variable can be set at the file level or at the directory level and point to different versions of Julia for different projects. It should be a string referencing the executable binary path.
+
+NB: On a Mac, the Julia binary is typically `Contents/Resources/julia/bin/julia` inside the distribution app bundle. You must either make sure `julia-snail-executable` is set to an absolute path, or configure your Emacs `exec-path` to correctly find the `julia` binary.
+
+
 ### Multiple REPLs
 
-To use multiple REPLs, set the local variables `julia-snail-repl-buffer` and `julia-snail-port`. They must be distinct per-project. They can be set at the [file level](https://www.gnu.org/software/emacs/manual/html_node/emacs/Specifying-File-Variables.html), or at the [directory level](https://www.gnu.org/software/emacs/manual/html_node/emacs/Directory-Variables.html). The latter approach is recommended, using a `.dir-locals.el` file at the root of a project directory.
+To use multiple REPLs, set the local variables `julia-snail-repl-buffer` and `julia-snail-port`. They must be distinct per-project. They can be set at the [file level](https://www.gnu.org/software/emacs/manual/html_node/emacs/Specifying-File-Variables.html), or at the [directory level](https://www.gnu.org/software/emacs/manual/html_node/emacs/Directory-Variables.html). The latter approach is recommended, using a `.dir-locals.el` file at the root of a project directory. (Emacs provides numerous interactive helper functions to help deal with file and directory variable scope: `add-dir-local-variable`, `delete-dir-local-variable`, `copy-dir-locals-to-file-locals`, `copy-dir-locals-to-file-locals-prop-line`, and `copy-file-locals-to-dir-locals`. Users of Projectile have additional tools at their disposal: `projectile-edit-dir-locals` and `projectile-skel-dir-locals`.)
 
 For example, consider two projects: `Mars` and `Venus`, both of which you wish to work on at the same time. They live in different directories.
 
@@ -151,11 +167,21 @@ The `Venus` project directory contains the following `.dir-locals.el` file:
 Now, source files in `Mars` will interact with the REPL running in the `*julia Mars*` buffer, and source files in `Venus` will interact with the REPL running in the `*julia Venus*` buffer.
 
 
-### Multiple Julia versions
+### Remote REPLs
 
-The `julia-snail-executable` variable can be set at the file level or at the directory level and point to different versions of Julia for different projects. It should be a string referencing the executable binary path.
+Snail can use a REPL located on a remote host using SSH tunneling and Emacs [Tramp](https://www.gnu.org/software/tramp/), subject to the following conditions:
 
-NB: On a Mac, the Julia binary is typically `Contents/Resources/julia/bin/julia` inside the distribution app bundle. You must either make sure `julia-snail-executable` is set to an absolute path, or configure your Emacs `exec-path` to correctly find the `julia` binary.
+1. A full Julia environment must be installed on the remote host.
+2. The code under development is likewise on the remote host. Emacs must open source files using Tramp.
+3. SSH access to the remote host must be configured with no-password access. Several ways exist to configure SSH to do this, all beyond the scope of the Snail README (hints: either use an agent or the ControlMaster setting; do _not_ just copy a no-passphrase key to the remote host!).
+
+If all these things are true, visit a remote Julia source file using Tramp, and start `julia-snail`. It should transparently start a fully-functional remote REPL.
+
+Just as with local Julia sessions, Snail can be configured using a remote `.dir-locals.el` file or another method for setting variables. In particular, `julia-snail-executable` may need to be changed.
+
+The SSH tunnel will, by default, open from `julia-snail-port` on the remote host to the same port on localhost. The remote host's port can be changed by setting `julia-snail-remote-port`.
+
+NB: To use `.dir-locals.el` over Tramp, you must set `enable-remote-dir-locals` to `t`!
 
 
 ### Extra Julia command-line arguments
@@ -195,20 +221,32 @@ Furthermore, if `alpha-1.jl` is refactored to sit outside the `Alpha` module, or
 `julia-snail-doc-lookup` shows the documentation string of the identifier at point. If the current Emacs session has [markdown-mode](https://github.com/jrblevin/markdown-mode) installed, it will be turned on with markup hiding enabled.
 
 
+### Multimedia and plotting
+
+Snail supports making diagrams by plugging into Julia's [multimedia I/O](https://docs.julialang.org/en/v1/base/io-network/#Multimedia-I/O) system. Any plot back-end which generates SVG or PNG output can display in an Emacs buffer, provided the Emacs instance itself supports images.
+
+To enable Emacs-Julia multimedia integration, either (1) set local variable `julia-snail-multimedia-enable` to `t`, preferably in `.dir-locals.el`, or (2) after the Julia REPL connects to Emacs, call the function `julia-snail-multimedia-toggle-display-in-emacs`.
+
+With Emacs multimedia display turned on, plotting commands in packages like Plots and Gadfly will display an Emacs buffer.
+
+The following variables control multimedia integration. It is best to set these in the project’s `.dir-locals.el`.
+
+- `julia-snail-multimedia-enable`: When set before starting a REPL, this turns on Emacs multimedia integration.
+- `julia-snail-multimedia-buffer-autoswitch`: Controls whether Emacs should automatically switch to the image buffer after a plotting command, or if it should only display it. Defaults to `nil` (off).
+- `julia-snail-multimedia-buffer-style`: Controls how the multimedia display buffer works. When `:single-reuse` (default), it uses one buffer, and overwrites it with new images as they come in from Julia. When set to `:single-new`, Snail will open a new buffer for each plot. When set to `:multi`, Snail uses a single buffer but appends new images to it rather than overwriting them. Note that `:multi` inserts image objects, but does not enable `image-mode` in the buffer, thus limiting zoom capabilities.
+
+As a simple example, activate Emacs plotting and try this code:
+
+```julia
+Pkg.add("Gadfly")
+import Gadfly
+Gadfly.plot(sin, 0, 2π)
+```
+
+
 ## Future improvements
 
-### Foundational
-
-- The Julia interaction side of the Snail server is single-threaded (using `@async`). This means the interaction locks up while the REPL is working or running code. Unfortunately, Julia as of version 1.2 does not have user-accessible low-level multithreading primitives necessary to implement a truly multi-threaded Snail server. The newer `Threads.@spawn` macro needs to be investigated.
-
-
-### Structural
-
--  The `libvterm` dependency forces the use of very recent Emacs releases, forces Emacs to be build with module support, complicates support for Windows, and is generally quite gnarly. It would be much better to re-implement the REPL in Elisp.
-
-
-### Functional
-
+-  The `libvterm` dependency forces the use of recent Emacs releases, forces Emacs to be build with module support, complicates support for Windows, and is generally quite gnarly. It would be much better to re-implement the REPL in Elisp.
 - Completion does not pick up local variables.
 - A real eldoc implementation would be great, but difficult to do with Julia’s generic functions.
 - A debugger would be great.
