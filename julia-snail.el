@@ -3,7 +3,7 @@
 
 ;; URL: https://github.com/gcv/julia-snail
 ;; Package-Requires: ((emacs "26.2") (dash "2.16.0") (julia-mode "0.3") (s "1.12.0") (spinner "1.7.3") (vterm "0.0.1"))
-;; Version: 1.0.0rc5
+;; Version: 1.1.4
 ;; Created: 2019-10-27
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -139,6 +139,7 @@ another."
   "If company-mode is installed, this flag determines if its documentation integration should be enabled."
   :tag "Control company-mode documentation integration"
   :group 'julia-snail
+  :safe 'booleanp
   :type 'boolean)
 
 
@@ -401,6 +402,7 @@ Returns nil if the poll timed out, t otherwise."
   (let ((extra-args (if (listp julia-snail-extra-args)
                         (mapconcat 'identity julia-snail-extra-args " ")
                       julia-snail-extra-args))
+        (remote-user (file-remote-p default-directory 'user))
         (remote-host (file-remote-p default-directory 'host)))
     (if (or (null remote-host) (string-equal "localhost" remote-host))
         ;; local REPL
@@ -412,7 +414,9 @@ Returns nil if the poll timed out, t otherwise."
         (format "ssh -t -L %1$s:localhost:%2$s %3$s %4$s %5$s -L %6$s"
                 julia-snail-port
                 (or julia-snail-remote-port julia-snail-port)
-                remote-host
+                (concat
+                 (if remote-user (concat remote-user "@") "")
+                 remote-host)
                 julia-snail-executable
                 extra-args
                 remote-dir-server-file)))))
@@ -483,7 +487,7 @@ returns \"/home/username/file.jl\"."
             (julia-snail--wait-while
              (not (string-equal "julia>" (current-word)))
              100
-             (* 0.750 1000))))
+             2000)))
         (unless (buffer-live-p repl-buf)
           (user-error "The vterm buffer is inactive; double-check julia-snail-executable path"))
         ;; now try to send the Snail startup command
@@ -667,7 +671,7 @@ code in the tmpfile will be parsed in Julia as if it were
 actually located in FILENAME starting at LINE-NUM and will be
 evaluated in the context of MODULE."
   (declare (indent defun))
-  (let* ((text (s-trim str))
+  (let* ((text (concat "begin\n" (s-trim str) "\nend\n"))
          (module-ns (julia-snail--construct-module-path module))
          (tmpfile (make-temp-file
                    (expand-file-name "julia-tmp" ; NOT julia-snail--efn
@@ -1116,7 +1120,12 @@ To create multiple REPLs, give these variables distinct values (e.g.:
           (pop-to-buffer repl-buf))
       ;; run Julia in a vterm and load the Snail server file
       (let ((vterm-shell (julia-snail--launch-command))
-            (vterm-buf (generate-new-buffer julia-snail-repl-buffer)))
+            ;; XXX: Allocate a buffer for the vterm. Bind its default-directory
+            ;; to the user's home because if (1) a remote REPL is being started,
+            ;; default-directory may be remote, and (2) Tramp may notice this,
+            ;; mess with the path, and run ssh incorrectly.
+            (vterm-buf (let ((default-directory (expand-file-name "~")))
+                         (generate-new-buffer julia-snail-repl-buffer))))
         (pop-to-buffer vterm-buf)
         (with-current-buffer vterm-buf
           ;; XXX: Set the error color to red to work around breakage relating to
