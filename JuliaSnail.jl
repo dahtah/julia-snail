@@ -23,7 +23,7 @@ module JuliaSnail
 
 # external dependency hack continues
 try
-   import CSTParser
+   import CSTParser,JuliaFormatter
 catch err
    if isa(err, ArgumentError)
       # force dependency installation
@@ -770,5 +770,6 @@ function send_to_client(expr, client_socket=nothing)
    println(client_socket, expr)
 end
 
+include("formatter.jl")
 
 end
