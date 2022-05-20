@@ -39,14 +39,22 @@
   :type 'boolean)
 
 (defcustom julia-snail/ob-julia-mirror-output-in-repl t
-  "If true, all output from code evaluated in ob-julia will also be shown in the julia REPL.
-Note that due to problem with async evaluation, trying to use emacs while julia code is running
-will cause your program's output to not be shown in org-mode, so this is currently a bad idea
-to disable."
+  "If true, all output from code evaluated in ob-julia will also be shown in the julia REPL."
   :tag "Control the display of code evaluation in the Julia REPL"
   :group 'julia-snail
   :safe 'booleanp
   :type 'boolean)
+
+(defcustom julia-snail/ob-julia-capture-io t
+  "If true, all intermediate printing during evaluation will be captured by ob-julia and printed into
+your org notebook"
+  :tag "Control the display of code evaluation in the Org Notebook"
+  :group 'julia-snail
+  :safe 'booleanp
+  :type 'boolean)
+
+(defvar julia-snail/ob-julia--point-inits (make-hash-table))
+(defvar julia-snail/ob-julia--point-finals (make-hash-table))
 
 
 ;;; --- implementation
@@ -54,18 +62,19 @@ to disable."
 (defun julia-snail/ob-julia-evaluate (module _body src-file out-file)
   (let* (;;(filename (julia-snail--efn (buffer-file-name (buffer-base-buffer)))) ; commented out to make byte-compiler happy
          ;;(line-num 0)                                                          ; commented out to make byte-compiler happy
-         (text (format "JuliaSnail.Extensions.ObJulia.babel_run_and_store(%s, \"%s\", \"%s\", %s, %s)"
+         (text (format "JuliaSnail.Extensions.ObJulia.babel_run_and_store(%s, \"%s\", \"%s\", %s, %s, %s)"
                        module
                        src-file
                        out-file
                        (if julia-snail/ob-julia-use-error-pane "true" "false")
-                       (if julia-snail/ob-julia-mirror-output-in-repl "true" "false"))))
+                       (if julia-snail/ob-julia-mirror-output-in-repl "true" "false")
+                       (if julia-snail/ob-julia-capture-io "true" "false"))))
     ;; This code was meant to startup julia-snail in the org buffer if it's not active, but caused an error
     ;; in org-mode on showing the first result of evalutation. Not sure why.
     ;; (unless (get-buffer julia-snail-repl-buffer)
     ;;   (progn
-    ;;  (julia-snail) t))
-    (julia-snail--send-to-server :Main text)))
+    ;;     (julia-snail) t))
+    (julia-snail--send-to-server :Main text :async nil)))
 
 ;; This function was adapted from ob-julia-vterm by Shigeaki Nishina (GPL-v3)
 ;; https://github.com/shg/ob-julia-vterm.el as of April 14, 2022
@@ -76,19 +85,37 @@ to disable."
                   (if maybe-module maybe-module "Main"))))
     (with-temp-file src-file (insert body))
     (julia-snail/ob-julia-evaluate module body src-file out-file)
-    (let ((c 0))
-      (while (and (< c 100) (= 0 (file-attribute-size (file-attributes out-file))))
-        (sit-for 0.1)
-        (setq c (1+ c))))
-    (with-temp-buffer
-      (insert-file-contents out-file)
-      (let ((bs (buffer-string)))
-        (if (catch 'loop
-              (dolist (line (split-string bs "\n"))
-                (if (> (length line) 12000)
-                    (throw 'loop t))))
-            "Output suppressed (line too long)"
-          bs)))))
+    (let ((out (with-temp-buffer
+                 (insert-file-contents out-file)
+                 (let ((bs (buffer-string)))
+                   (if (catch 'loop
+                         (dolist (line (split-string bs "\n"))
+                           (if (> (length line) 12000)
+                               (throw 'loop t))))
+                       "Output suppressed (line too long)"
+                     bs)))))
+      (puthash (current-thread) (copy-marker (point)) julia-snail/ob-julia--point-finals)
+      (goto-char (gethash (current-thread) julia-snail/ob-julia--point-inits))
+      out)))
+
+(defun julia-snail/ob-julia--in-julia-src-blockp ()
+  (let ((info (org-babel-get-src-block-info)))
+    (and info (string-equal (nth 0 info) "julia"))))
+
+(defun julia-snail/ob-julia--around-ctrl-c-ctrl-c (old &rest arguments)
+  (if (julia-snail/ob-julia--in-julia-src-blockp)
+      (let ((pt-init (copy-marker (point))))
+        (make-thread
+         (lambda ()
+           (puthash (current-thread) pt-init julia-snail/ob-julia--point-inits)
+           (puthash (current-thread) pt-init julia-snail/ob-julia--point-finals)
+           (let ((res (apply old arguments)))
+             (goto-char (gethash (current-thread) julia-snail/ob-julia--point-finals))
+             (remhash (current-thread) julia-snail/ob-julia--point-inits)
+             (remhash (current-thread) julia-snail/ob-julia--point-finals)
+             res))))
+    (apply old arguments)))
+
 
 ;; Deal with colour ANSI escape colour codes
 ;; from https://emacs.stackexchange.com/a/63562/19896
@@ -133,9 +160,11 @@ to disable."
   :init-value nil
   (cond
    (julia-snail/ob-julia-interaction-mode
-    (add-hook 'completion-at-point-functions 'julia-snail/ob-julia-completion-at-point nil t))
+    (add-hook 'completion-at-point-functions 'julia-snail/ob-julia-completion-at-point nil t)
+    (advice-add 'org-ctrl-c-ctrl-c :around #'julia-snail/ob-julia--around-ctrl-c-ctrl-c))
    (t
-    (remove-hook 'after-revert-hook 'julia-snail-interaction-mode t))))
+    (remove-hook 'completion-at-point-functions 'julia-snail/ob-julia-completion-at-point t)
+    (advice-remove 'org-ctrl-c-ctrl-c #'julia-snail/ob-julia--around-ctrl-c-ctrl-c))))
 
 
 ;;; --- initialiation function
@@ -145,7 +174,7 @@ to disable."
 (defun julia-snail/ob-julia-init (repl-buf)
   (julia-snail--send-to-server
     '("JuliaSnail" "Extensions")
-    "load([\"ob-julia\" \"ObJulia.jl\"])"
+    "load([\"ob-julia\" \"src/ObJulia.jl\"])"
     :repl-buf repl-buf
     :async nil)
   (add-hook 'org-mode-hook #'julia-snail/ob-julia-interaction-mode)
