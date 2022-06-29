@@ -1602,11 +1602,23 @@ This will occur in the context of the Main module, just as it would at the REPL.
       :callback-success (lambda (_request-info &optional _data)
                           (message "Package activated: %s" expanded-dir)))))
 
+;get all symbols from Main as possible suggestions for doc. lookup, mimicking REPL behaviour
+(defun julia-snail--lookup-all ()
+  (julia-snail--send-to-server
+    :Main
+    "JuliaSnail.replcompletion(\"\",Main)"
+    :async nil))
+
 (defun julia-snail-doc-lookup (identifier)
   "Look up Julia documentation for symbol at point (IDENTIFIER)."
-  (interactive (list (read-string
+  (interactive (list (completing-read
                       "Documentation look up: "
-                      (unless current-prefix-arg (julia-snail--identifier-at-point)))))
+                      (julia-snail--lookup-all)
+                      nil
+                      nil
+                      (unless current-prefix-arg (julia-snail--identifier-at-point))
+                      )))
+;                      (unless current-prefix-arg (julia-snail--identifier-at-point)))))
   (let* ((module (julia-snail--module-at-point))
          (name (s-concat (s-join "." module) "." identifier))
          (doc (julia-snail--send-to-server
@@ -1621,6 +1633,8 @@ This will occur in the context of the Main module, just as it would at the REPL.
                         "Documentation not found!\nDouble-check your package activation and imports."
                       doc)
                     :markdown t))))
+
+
 
 (defun julia-snail-repl-go-back ()
   "Return to a source buffer from a Julia REPL buffer."
