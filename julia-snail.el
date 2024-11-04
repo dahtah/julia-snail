@@ -2,8 +2,8 @@
 
 
 ;; URL: https://github.com/gcv/julia-snail
-;; Package-Requires: ((emacs "26.2") (dash "2.16.0") (julia-mode "0.3") (s "1.12.0") (spinner "1.7.3") (vterm "0.0.1") (popup "0.5.9"))
-;; Version: 1.1.5
+;; Package-Requires: ((emacs "26.2") (dash "2.16.0") (julia-mode "0.3") (s "1.12.0") (spinner "1.7.3") (popup "0.5.9"))
+;; Version: 1.3.2
 ;; Created: 2019-10-27
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -32,6 +32,7 @@
 
 (require 'cl-lib)
 (require 'dash)
+(require 'easymenu)
 (require 'json)
 (require 'popup)
 (require 'pulse)
@@ -41,8 +42,33 @@
 (require 'spinner)
 (require 'subr-x)
 (require 'thingatpt)
-(require 'vterm)
 (require 'xref)
+
+;; XXX: One of vterm or eat must be manually installed before Snail starts.
+;; Picking one or the other involves tradeoffs best left to the user, and
+;; therefore neither is added to the Package-Requires header. Briefly, vterm
+;; supports older versions of Emacs (down to 26) but has more complicated module
+;; compilation needs. Eat is a simpler dependency, but requires Emacs 28. The
+;; two emulate terminals differently, and so one may be preferable to the other
+;; for other reasons.
+(when (not (or (locate-library "vterm")
+               (locate-library "eat")))
+  (user-error "Neither vterm nor eat dependencies detected; please install one or the other"))
+
+(when (locate-library "vterm")
+  (require 'vterm))
+(declare-function vterm-end-of-line "vterm.el")
+(declare-function vterm-mode "vterm.el")
+(declare-function vterm-send-key "vterm.el")
+(declare-function vterm-send-return "vterm.el")
+(declare-function vterm-send-string "vterm.el")
+(defvar vterm-shell)
+
+(when (locate-library "eat")
+  (require 'eat))
+(declare-function eat-term-send-string "eat.el")
+(declare-function eat-self-input "eat.el")
+(defvar eat-terminal)
 
 
 ;;; --- customizations
@@ -94,6 +120,17 @@
   :type 'string)
 (make-variable-buffer-local 'julia-snail-repl-buffer)
 
+(defcustom julia-snail-terminal-type
+  (if (locate-library "vterm") :vterm :eat) ; default to :vterm for historical compatibility
+  "Which Emacs terminal emulator to use for the Julia REPL."
+  :tag "Terminal type"
+  :group 'julia-snail
+  :options '(:eat :vterm)
+  :safe (lambda (v) (memq v '(:eat :vterm)))
+  :type '(choice (const :tag "Eat" :eat)
+                 (const :tag "vterm" :vterm)))
+;;(make-variable-buffer-local 'julia-snail-terminal-type) ; XXX: Let's not make this a buffer-local switch. Too messy.
+
 (defcustom julia-snail-show-error-window t
   "When t: show compilation errors in separate window. When nil: display errors in the minibuffer."
   :tag "Show compilation errors in separate window"
@@ -139,7 +176,7 @@ another."
                  (const :tag "Append images to buffer" :multi)))
 (make-variable-buffer-local 'julia-snail-multimedia-buffer-style)
 
-(defcustom julia-snail-company-doc-enable t
+(defcustom julia-snail-completions-doc-enable t
   "If company-mode is installed, this flag determines if its documentation integration should be enabled."
   :tag "Control company-mode documentation integration"
   :group 'julia-snail
@@ -173,6 +210,25 @@ another."
   "Face used to display popups. If nil, try to make popups look reasonable."
   :group 'julia-snail
   :type 'face)
+
+(defcustom julia-snail-imenu-style :module-tree
+  "Control how imenu should be structured.
+nil means disable Snail-specific imenu integration (fall back on julia-mode implementation).
+:flat means entries are prefixed by Julia module, e.g. 'MyModule.myfunction1()'
+:module-tree means entries use Julia modules to make subtrees, so 'myfunction1()' becomes an entry under 'MyModule'. This is useful with something like the imenu-list package."
+  :tag "Control imenu integration"
+  :group 'julia-snail
+  :safe (lambda (v) (memq v '(:flat :module-tree nil)))
+  :set (lambda (symbol value)
+         (set-default symbol value)
+         ;; invalidate the cache in all buffers
+         (cl-loop for buf in (buffer-list) do
+                  (with-current-buffer buf
+                    (defvar julia-snail--imenu-cache)
+                    (setq julia-snail--imenu-cache nil))))
+  :type '(choice (const :tag "Flat" :flat)
+                 (const :tag "Module-based tree structure" :module-tree)
+                 (const :tag "Use julia-mode" nil)))
 
 (defcustom julia-snail-extensions (list)
   "A list of enabled Snail extensions."
@@ -212,8 +268,7 @@ another."
                    result)))
     ;; actually put together the list
     (append
-     (list "JuliaSnail.jl" "Manifest.toml" "Project.toml"
-           "extensions")
+     (list "JuliaSnail.jl" "Project.toml" "extensions")
      (let ((default-directory (file-name-directory (or load-file-name (buffer-file-name)))))
        (list-extension-files)))))
 
@@ -226,6 +281,24 @@ another."
   (-find (lambda (f)
            (string-equal "JuliaSnail.jl" (file-name-nondirectory f)))
          julia-snail--julia-files-local))
+
+
+;;; --- supporting data structures
+
+(cl-defstruct julia-snail--request-tracker
+  "Snail protocol request tracking data structure."
+  repl-buf
+  originating-buf
+  (callback-success (lambda (&optional _data) (message "Snail command succeeded")))
+  (callback-failure (lambda () (message "Snail command failed")))
+  (display-error-buffer-on-failure? t)
+  tmpfile
+  tmpfile-local-remote)
+
+(cl-defstruct julia-snail--imenu-cache-entry
+  timestamp
+  tick
+  value)
 
 
 ;;; --- variables
@@ -248,9 +321,13 @@ another."
 (defvar julia-snail--cache-proc-basedir
   (make-hash-table :test #'equal))
 
+(defvar julia-snail--imenu-fallback-index-function nil)
+
 (defvar-local julia-snail--repl-go-back-target nil)
 
 (defvar-local julia-snail--popups (list))
+
+(defvar-local julia-snail--imenu-cache nil)
 
 (defvar julia-snail--compilation-regexp-alist
   '(;; matches "while loading /tmp/Foo.jl, in expression starting on line 2"
@@ -268,18 +345,6 @@ Uses function `compilation-shell-minor-mode'.")
 
 (defvar julia-snail-mode)
 (defvar julia-snail-repl-mode)
-
-
-;;; --- Snail protocol request tracking data structure
-
-(cl-defstruct julia-snail--request-tracker
-  repl-buf
-  originating-buf
-  (callback-success (lambda (&optional _data) (message "Snail command succeeded")))
-  (callback-failure (lambda () (message "Snail command failed")))
-  (display-error-buffer-on-failure? t)
-  tmpfile
-  tmpfile-local-remote)
 
 
 ;;; --- supporting functions
@@ -473,12 +538,13 @@ Returns nil if the poll timed out, t otherwise."
                       :async nil))
                (popup-params (julia-snail--popup-params block-end))
                (str (if (equal err :nothing)
-                        (julia-snail--send-to-server
-                          :Main
-                          (format "JuliaSnail.PopupDisplay.format(ans, %s, %s)"
-                                  (car popup-params)
-                                  (cadr popup-params))
-                          :async nil)
+                        (when julia-snail-popup-display-eval-results
+                          (julia-snail--send-to-server
+                            :Main
+                            (format "JuliaSnail.PopupDisplay.format(ans, %s, %s)"
+                                    (car popup-params)
+                                    (cadr popup-params))
+                            :async nil))
                       "error")))
           (julia-snail--popup-display popup-block-end str :use-cleanup-kludge (eq :command julia-snail-popup-display-eval-results)))
       ;; evaluate through the Snail server:
@@ -513,7 +579,7 @@ Returns nil if the poll timed out, t otherwise."
                                    (concat "julia-snail-" checksum "/"))))
     (unless (file-exists-p snail-remote-dir)
       (make-directory snail-remote-dir)
-      (let ((default-directory (file-name-directory (symbol-file 'julia-snail))))
+      (let ((default-directory (file-name-directory (locate-library "julia-snail"))))
         (cl-loop for f in julia-snail--julia-files do
                  (if (file-directory-p f)
                      (make-directory (concat snail-remote-dir f))
@@ -533,9 +599,12 @@ Returns nil if the poll timed out, t otherwise."
     (cond
      ;; local REPL
      ((equal nil remote-method)
-      (format "%s %s -L %s" julia-snail-executable extra-args julia-snail--server-file))
+      (format "%s -i %s -L %s" julia-snail-executable extra-args julia-snail--server-file))
      ;; remote REPL
-     ((string-equal "ssh" remote-method)
+     ((or (string-equal "ssh" remote-method)
+          (string-equal "sshx" remote-method)
+          (string-equal "scp" remote-method)
+          (string-equal "scpx" remote-method))
       (format "ssh -t -L %1$s:localhost:%2$s %3$s %4$s %5$s -L %6$s"
               julia-snail-port
               (or julia-snail-remote-port julia-snail-port)
@@ -551,7 +620,53 @@ Returns nil if the poll timed out, t otherwise."
 	      remote-host
 	      julia-snail-executable
 	      extra-args
-	      remote-dir-server-file)))))
+	      remote-dir-server-file))
+     ;; unsupported method
+     (t
+      (user-error "Unsupported Tramp method %s" remote-method)))))
+
+(defun julia-snail--start (source-buf)
+  "Underlying command for julia-snail invocation.
+Supports multiple terminal implementations."
+  (let* ((launch-command (julia-snail--launch-command))
+         ;; XXX: Set the error color to red to work around breakage relating to
+         ;; some color themes and terminal combinations, see
+         ;; https://github.com/gcv/julia-snail/issues/11
+         (process-environment (append '("JULIA_ERROR_COLOR=red") process-environment))
+         ;; XXX: When a remote REPL is being started, bind the terminal buffer's
+         ;; default-directory to the user's home because if (1) a remote REPL is
+         ;; being started, default-directory may be remote, and (2) Tramp may
+         ;; notice this, mess with the path, and run ssh incorrectly.
+         (default-directory (if (file-remote-p default-directory)
+                                (expand-file-name "~")
+                              default-directory)))
+    (let ((terml-buf
+           ;; first, start a REPL process in a new buffer
+           (cond
+            ;; vterm
+            ((eq :vterm julia-snail-terminal-type)
+             (let ((vterm-shell launch-command)
+                   (terml-buf (generate-new-buffer julia-snail-repl-buffer)))
+               (pop-to-buffer terml-buf)
+               (with-current-buffer terml-buf
+                 (vterm-mode))
+               terml-buf))
+            ;; eat
+            ((eq :eat julia-snail-terminal-type)
+             (let ((terml-buf (eat launch-command t))
+                   (repl-buffer-name julia-snail-repl-buffer))
+               (with-current-buffer terml-buf
+                 (rename-buffer repl-buffer-name))
+               terml-buf))
+            ;; unsupported value
+            (t
+             (user-error "unsupported value for julia-snail-terminal-type: %s" julia-snail-terminal-type)))))
+      ;; then deal with some setup on that buffer
+      (with-current-buffer terml-buf
+        (when source-buf
+          (julia-snail--copy-buffer-local-vars source-buf)
+          (setq julia-snail--repl-go-back-target source-buf))
+        (julia-snail-repl-mode)))))
 
 (defun julia-snail--efn (path &optional starting-dir)
   "A variant of expand-file-name that (1) just does
@@ -657,9 +772,9 @@ returns \"/home/username/file.jl\"."
             (julia-snail--wait-while
              (not (string-equal "julia>" (current-word)))
              100
-             2000)))
+             3000)))
         (unless (buffer-live-p repl-buf)
-          (user-error "The vterm buffer is inactive; double-check julia-snail-executable path"))
+          (user-error "The REPL terminal buffer is inactive; double-check julia-snail-executable path"))
         ;; now try to send the Snail startup command
         (julia-snail--send-to-repl
          (format "JuliaSnail.start(%d%s) ; # please wait, time-to-first-plot..."
@@ -671,13 +786,12 @@ returns \"/home/username/file.jl\"."
           ;; wait a while in case dependencies need to be downloaded
           :polling-timeout (* 5 60 1000)
           :async nil)
-        ;; connect to the server
         (let ((netstream (let ((attempt 0)
-                               (max-attempts 5)
+                               (max-attempts 15)
                                (stream nil))
                            (while (and (< attempt max-attempts) (null stream))
                              (cl-incf attempt)
-                             (message "Snail connecting to Julia process, attempt %d/5..." attempt)
+                             (message "Snail connecting to Julia process, attempt %d/%d..." attempt max-attempts)
                              (condition-case nil
                                  (setq stream (open-network-stream "julia-process" process-buf "localhost" julia-snail-port))
                                (error (when (< attempt max-attempts)
@@ -756,6 +870,41 @@ returns \"/home/username/file.jl\"."
   )
 
 
+;;; --- terminal emulator compatibility wrappers
+
+(defun julia-snail--terminal-send-string (str)
+  (cond
+   ;; Eat
+   ((eq 'eat-mode major-mode)
+    (eat-term-send-string eat-terminal str)
+    ;; TODO: Remove this call when https://codeberg.org/akib/emacs-eat/issues/100 is fixed.
+    (when (fboundp 'eat--process-input-queue)
+      (declare-function eat--process-input-queue "eat.el")
+      (eat--process-input-queue (current-buffer))))
+   ;; vterm
+   ((eq 'vterm-mode major-mode)
+    (vterm-send-string str))
+   ;; error and debugging
+   (t
+    (error "function called out of context; (with-current-buffer repl-buf ...) required"))))
+
+(defun julia-snail--terminal-send-return ()
+  (cond
+   ;; Eat
+   ((eq 'eat-mode major-mode)
+    (eat-term-send-string eat-terminal "\n")
+    ;; TODO: Remove this call when https://codeberg.org/akib/emacs-eat/issues/100 is fixed.
+    (when (fboundp 'eat--process-input-queue)
+      (declare-function eat--process-input-queue "eat.el")
+      (eat--process-input-queue (current-buffer))))
+   ;; vterm
+   ((eq 'vterm-mode major-mode)
+    (vterm-send-return))
+   ;; error and debugging
+   (t
+    (error "function called out of context; (with-current-buffer repl-buf ...) required"))))
+
+
 ;;; --- Julia REPL and Snail server interaction functions
 
 (cl-defun julia-snail--send-to-repl
@@ -771,16 +920,20 @@ wait for the REPL prompt to return, otherwise return immediately."
   (declare (indent defun))
   (unless repl-buf
     (user-error "No Julia REPL buffer %s found; run julia-snail" julia-snail-repl-buffer))
-  (with-current-buffer repl-buf
-    (vterm-send-string str)
-    (when send-return (vterm-send-return)))
-  (unless async
-    ;; wait for the inclusion to succeed (i.e., the prompt prints)
-    (julia-snail--wait-while
-     (with-current-buffer repl-buf
-       (not (string-equal "julia>" (current-word))))
-     polling-interval
-     polling-timeout)))
+  (let ((pre-write-size (buffer-size repl-buf)))
+    (with-current-buffer repl-buf
+      (julia-snail--terminal-send-string str)
+      (when send-return (julia-snail--terminal-send-return)))
+    (unless async
+      ;; wait for the buffer to accept the new input, or a race condition may
+      ;; occur with non-async prompt check below
+      (julia-snail--wait-while (= pre-write-size (buffer-size repl-buf)) polling-interval polling-timeout)
+      ;; wait for the inclusion to succeed (i.e., the prompt prints)
+      (julia-snail--wait-while
+       (with-current-buffer repl-buf
+         (not (string-equal "julia>" (current-word))))
+       polling-interval
+       polling-timeout))))
 
 (cl-defun julia-snail--send-to-server
     (module
@@ -993,6 +1146,10 @@ evaluated in the context of MODULE."
         (funcall callback-failure request-info))))
   (julia-snail--response-base reqid))
 
+(defun julia-snail--response-interrupt (reqid)
+  "Snail task interruption response handler for REQID."
+  (julia-snail--response-base reqid))
+
 
 ;;; --- CST parser interface
 
@@ -1031,6 +1188,14 @@ evaluated in the context of MODULE."
                (puthash file modules includes)))
     ;; TODO: Maybe there's a situation in which returning :error is appropriate?
     includes))
+
+(defun julia-snail--cst-code-tree (buf)
+  (let* ((encoded (julia-snail--encode-base64 buf))
+         (res (julia-snail--send-to-server
+                :Main
+                (format "JuliaSnail.CST.codetree(\"%s\")" encoded)
+                :async nil)))
+    res))
 
 
 ;;; --- Julia module tracking implementation
@@ -1180,21 +1345,15 @@ evaluated in the context of MODULE."
   "Implementation for Emacs `completion-at-point' system using REPL.REPLCompletions as the provider."
   (let ((identifier (julia-snail--identifier-at-point))
         (bounds (julia-snail--identifier-at-point-bounds))
+        (repl-buf (get-buffer julia-snail-repl-buffer))
         (split-on "\\.")
         (prefix "")
         start)
-    (when bounds
+    (when (and bounds repl-buf)
       ;; If identifier starts with a backslash we need to add an extra "\\" to
       ;; make sure that the string which arrives to the completion provider on the server starts with "\\".
       (when (s-equals-p (substring identifier 0 1) "\\")
         (setq prefix "\\"))
-      ;; check if identifier at point is inside a string and attach the opening quotes so
-      ;; we get path completion.
-      (when-let (prev (char-before (car bounds)))
-        (when (char-equal prev ?\")
-          (setq identifier (concat "\\\"" identifier))
-          ;; TODO: add support for Windows paths (splitting on "\\" when appropriate)
-          (setq split-on "/")))
       ;; If identifier is not a string, we split on "." so that completions of
       ;; the form Module.f -> Module.func work (since
       ;; `julia-snail--repl-completions' will return only "func" in this case)
@@ -1204,6 +1363,90 @@ evaluated in the context of MODULE."
             (completion-table-dynamic
              (lambda (_) (julia-snail--repl-completions (concat prefix identifier) module-finder)))
             :exclusive 'no))))
+
+
+;;; --- imenu enhancement
+
+;; TODO: Add marginalia metadata. Use completion-extra-properties
+;; :annotation-function for this? How, exactly?
+
+(defun julia-snail--imenu-helper (tree modules)
+  (when tree
+    (let* ((first-node (car tree))
+           (first-node (if (eq 'quote (car first-node))
+                           (cadr first-node)
+                         first-node))
+           (first-node-type (nth 0 first-node))
+           (first-node-name (nth 1 first-node))
+           (first-node-location (byte-to-position (nth 2 first-node))))
+      (cons
+       (if (eq 'module (car first-node))
+           (cons
+            (if (eq :module-tree julia-snail-imenu-style)
+                first-node-name
+              (cons
+               (format "module %s" (s-join "." (append modules (list first-node-name))))
+               first-node-location))
+            (julia-snail--imenu-helper
+             (nth 3 first-node)
+             (append modules (list first-node-name))))
+         (cons
+          (if (eq :module-tree julia-snail-imenu-style)
+              (format "%s %s" first-node-type first-node-name)
+            (format "%s %s" first-node-type
+                    (s-join "." (append modules (list first-node-name)))))
+          first-node-location))
+       (julia-snail--imenu-helper (cdr tree) modules)))))
+
+(defun julia-snail--imenu-included-module-helper (normal-tree)
+  ;; XXX: This fugly kludge transforms imenu trees in a way that injects modules
+  ;; cached through include()ed files at the root:
+  ;;
+  ;; if included-modules is ("Alpha" "Bravo")
+  ;; and normal-tree is ((function "f1" ...))
+  ;; then this returns (("Alpha" ("Bravo" (function "f1" ...))))
+  ;;
+  ;; There must be a cleaner way to implement this logic.
+  (let ((included-modules (julia-snail--module-for-file (buffer-file-name (buffer-base-buffer)))))
+    (cl-labels ((some-helper
+                 (incls norms first-time)
+                 (if (null incls)
+                     norms
+                   (let* ((next (some-helper (cdr incls) norms nil))
+                          (tail (cons (car incls) (if first-time(list next) next))))
+                     (if first-time (list tail) tail)))))
+      (some-helper included-modules normal-tree t))))
+
+(cl-defun julia-snail-imenu ()
+  ;; exit early if Snail's imenu integration is turned off, or no Snail session is running
+  (unless (and julia-snail-imenu-style (get-buffer julia-snail-repl-buffer))
+    (cl-return-from julia-snail-imenu
+      (funcall julia-snail--imenu-fallback-index-function)))
+  ;; check the cache and debounce
+  (when julia-snail--imenu-cache
+    (when (or
+           ;; unmodified buffer
+           (= (julia-snail--imenu-cache-entry-tick julia-snail--imenu-cache)
+              (buffer-modified-tick))
+           ;; it hasn't been long enough since the last modification (5 seconds)
+           (< (- (float-time) (julia-snail--imenu-cache-entry-timestamp julia-snail--imenu-cache))
+              5.0))
+      (cl-return-from julia-snail-imenu
+        (julia-snail--imenu-cache-entry-value julia-snail--imenu-cache))))
+  ;; cache miss: ask Julia to parse the file and return the imenu index
+  (let* ((code-tree (julia-snail--cst-code-tree (current-buffer)))
+         (imenu-index-raw (julia-snail--imenu-included-module-helper (julia-snail--imenu-helper code-tree (list))))
+         (imenu-index (if (eq :flat julia-snail-imenu-style)
+                          (-flatten imenu-index-raw)
+                        imenu-index-raw)))
+    ;; update the cache
+    (setq julia-snail--imenu-cache
+          (make-julia-snail--imenu-cache-entry
+           :timestamp (float-time)
+           :tick (buffer-modified-tick)
+           :value imenu-index))
+    ;; return the result
+    imenu-index))
 
 
 ;;; --- popup display support
@@ -1245,16 +1488,24 @@ evaluated in the context of MODULE."
                                    line " \n")))
            (display-str (s-trim-right (apply #'concat lines)))
            (popup (let ((popup-tip-max-width (window-width)))
-                    (popup-tip display-str
-                               :point pt
-                               :around nil
-                               :face (if julia-snail-popup-display-face
-                                         julia-snail-popup-display-face
-                                       `(:background
-                                         ,(julia-snail--color-shift-hex (face-attribute 'default :background) (face-attribute 'default :foreground) :by 63)
-                                         :foreground ,(face-attribute 'default :foreground)))
-                               :nowait t
-                               :nostrip t))))
+                    ;; XXX: Dirty workaround for #110. popup-tip calls
+                    ;; popup-replace-displayable which is SLOW (as of
+                    ;; 2022-09-26). So just bypass it until popup.el releases a
+                    ;; fixed version, and then adjust the Snail dependency
+                    ;; version.
+                    (declare-function popup-replace-displayable "popup.el")
+                    (cl-letf (((symbol-function 'popup-replace-displayable)
+                               (lambda (str &optional _rep) str)))
+                      (popup-tip display-str
+                                 :point pt
+                                 :around nil
+                                 :face (if julia-snail-popup-display-face
+                                           julia-snail-popup-display-face
+                                         `(:background
+                                           ,(julia-snail--color-shift-hex (face-attribute 'default :background) (face-attribute 'default :foreground) :by 63)
+                                           :foreground ,(face-attribute 'default :foreground)))
+                                 :nowait t
+                                 :nostrip t)))))
       (add-to-list 'julia-snail--popups popup)
       (when use-cleanup-kludge
         (setq julia-snail--popup-cleanup-skip-kludge t))
@@ -1286,9 +1537,9 @@ evaluated in the context of MODULE."
       (add-hook hook #'julia-snail--popup-cleanup nil 'local))))
 
 
-;;; --- company-mode support
+;;; --- support for completion modes' auxiliary doc modes (company-quickhelp and corfu-doc)
 
-(defun julia-snail--company-doc-buffer (str)
+(defun julia-snail--completions-doc-buffer (str)
   (let* ((module (julia-snail--module-at-point))
          (name (s-concat (s-join "." module) "." str))
          (doc (julia-snail--send-to-server
@@ -1302,17 +1553,17 @@ evaluated in the context of MODULE."
                 (if (eq :nothing doc)
                     "Documentation not found!\nDouble-check your package activation and imports."
                   doc)
-                :markdown nil)))
+                :markdown t)))
       (with-current-buffer buf
         (julia-snail--add-to-perspective buf)
         (font-lock-ensure))
       buf)))
 
-(defun julia-snail-company-capf ()
+(defun julia-snail-completions-doc-capf ()
   (interactive)
   (let* ((comp (julia-snail-repl-completion-at-point))
          (doc (list :company-doc-buffer
-                    #'julia-snail--company-doc-buffer)))
+                    #'julia-snail--completions-doc-buffer)))
     (cl-concatenate 'list comp doc)))
 
 
@@ -1361,7 +1612,7 @@ evaluated in the context of MODULE."
         ;; check buffer size and insert separator as needed
         (when (> (buffer-size) 0)
           (goto-char (point-max))
-          (insert "\n"))
+          (insert "\n\n"))
         (if (image-type-available-p 'imagemagick)
             (let ((shortest (car
                              (-sort
@@ -1372,8 +1623,7 @@ evaluated in the context of MODULE."
               (if shortest
                   (insert-image (create-image decoded-img 'imagemagick t :height (round (* 0.80 (window-pixel-height shortest)))))
                 (insert-image (create-image decoded-img 'imagemagick t))))
-          (insert-image (create-image decoded-img nil t)))
-        (insert "\n"))
+          (insert-image (create-image decoded-img nil t))))
       (dolist (win (get-buffer-window-list mm-buf))
         (set-window-point win (point-max)))
       (read-only-mode 1)
@@ -1410,7 +1660,7 @@ evaluated in the context of MODULE."
 (defun julia-snail--extension-load (extname)
   (let ((extsym (julia-snail--extension-symbol extname)))
     (unless (featurep extsym)
-      (let* ((current-file (symbol-file 'julia-snail))
+      (let* ((current-file (locate-library "julia-snail"))
              (extdir (concat (file-name-directory current-file)
                              (file-name-as-directory "extensions")
                              (file-name-as-directory (symbol-name extname))))
@@ -1433,31 +1683,13 @@ To create multiple REPLs, give these variables distinct values (e.g.:
   (let ((source-buf (current-buffer))
         (repl-buf (get-buffer julia-snail-repl-buffer)))
     (if repl-buf
+        ;; Julia session exists
         (progn
-          (setf (buffer-local-value 'julia-snail--repl-go-back-target repl-buf) source-buf)
-          (pop-to-buffer repl-buf))
-      ;; run Julia in a vterm and load the Snail server file
-      (let ((vterm-shell (julia-snail--launch-command))
-            ;; XXX: Allocate a buffer for the vterm. When a remote REPL is being
-            ;; started, bind the vterm buffer's default-directory to the user's
-            ;; home because if (1) a remote REPL is being started,
-            ;; default-directory may be remote, and (2) Tramp may notice this,
-            ;; mess with the path, and run ssh incorrectly.
-            (vterm-buf (let ((default-directory (if (file-remote-p default-directory)
-                                                    (expand-file-name "~")
-                                                  default-directory)))
-                         (generate-new-buffer julia-snail-repl-buffer))))
-        (pop-to-buffer vterm-buf)
-        (with-current-buffer vterm-buf
-          ;; XXX: Set the error color to red to work around breakage relating to
-          ;; some color themes and terminal combinations, see
-          ;; https://github.com/gcv/julia-snail/issues/11
-          (let ((process-environment (append '("JULIA_ERROR_COLOR=red") process-environment)))
-            (vterm-mode))
-          (when source-buf
-            (julia-snail--copy-buffer-local-vars source-buf)
+          (with-current-buffer repl-buf
             (setq julia-snail--repl-go-back-target source-buf))
-          (julia-snail-repl-mode))))))
+          (pop-to-buffer repl-buf))
+      ;; run a new Julia REPL in a terminal and load the Snail server file
+      (julia-snail--start source-buf))))
 
 (defun julia-snail-send-line ()
   "Send the line at point to the Julia REPL and evaluate it.
@@ -1465,8 +1697,8 @@ Without a prefix arg, evaluation occurs in the context of the current module.
 If one prefix arg is used (C-u), evaluation occurs in the context of the Main module.
 If two or more prefix args are used (C-u C-u), the code is instead copied directly into the REPL, and evaluation occurs in the context of the Main module."
   (interactive)
-  (let ((block-start (point-at-bol))
-        (block-end (point-at-eol)))
+  (let ((block-start (line-beginning-position))
+        (block-end (line-end-position)))
     (unless (eq block-start block-end)
       (julia-snail--send-helper
        block-start block-end
@@ -1628,11 +1860,22 @@ This will occur in the context of the Main module, just as it would at the REPL.
   (when (bound-and-true-p julia-snail--repl-go-back-target)
     (pop-to-buffer julia-snail--repl-go-back-target)))
 
-(defun julia-snail-repl-vterm-kill-line ()
+(defun julia-snail-repl-terminal-kill-line ()
   "Make kill-line (C-k by default) save content to the kill ring."
   (interactive)
-  (kill-ring-save (point) (vterm-end-of-line))
-  (vterm-send-key "k" nil nil t))
+  (cond
+   ;; Eat
+   ((eq 'eat-mode major-mode)
+    (kill-ring-save (point) (line-end-position))
+    (eat-self-input 1 ?\C-k)
+    )
+   ;; vterm
+   ((eq 'vterm-mode major-mode)
+    (kill-ring-save (point) (vterm-end-of-line))
+    (vterm-send-key "k" nil nil t))
+   ;; error and debugging
+   (t
+    (error "function called out of context; (with-current-buffer repl-buf ...) required"))))
 
 (defun julia-snail-clear-caches ()
   "Clear connection-specific internal Snail xref, completion, and module caches.
@@ -1659,6 +1902,35 @@ autocompletion aware of the available modules."
     (message "Caches updated: parent module %s"
              (julia-snail--construct-module-path module))))
 
+(defun julia-snail-interrupt-task ()
+  "Try to interrupt a Julia computation task which was started on the Emacs side."
+  (interactive)
+  (let* ((running-reqids (hash-table-keys julia-snail--requests))
+         ;; TODO: Filter these reqids for valid ones (e.g. ones with valid REPL buffers?)
+         (reqid (cond ((= 0 (length running-reqids))
+                       (message "No Julia tasks currently running (that the Emacs side knows about)")
+                       nil)
+                      ((= 1 (length running-reqids))
+                       (-first-item running-reqids))
+                      (t
+                       (completing-read "Select id of Julia request to interrupt"
+                                        ;; TODO: This needs to include metadata and annotations for what
+                                        ;; computational task each reqid corresponds to (like a line number
+                                        ;; or the actual code).
+                                        running-reqids)))))
+    (when reqid
+      (let* ((repl-buf (get-buffer julia-snail-repl-buffer))
+             (resp (julia-snail--send-to-server
+                     '("JuliaSnail" "Tasks")
+                     (format "interrupt(\"%s\")" reqid)
+                     :repl-buf repl-buf
+                     :async nil))
+             (res (car resp)))
+        (if res
+            (message "Interrupt scheduled for Julia reqid %s" reqid)
+          (message "Unknown reqid %s on the Julia side" reqid)
+          (remhash reqid julia-snail--requests))))))
+
 
 ;;; --- keymaps
 
@@ -1679,51 +1951,80 @@ autocompletion aware of the available modules."
 (defvar julia-snail-repl-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-z") #'julia-snail-repl-go-back)
-    (define-key map (kbd "C-k") #'julia-snail-repl-vterm-kill-line)
+    (define-key map (kbd "C-k") #'julia-snail-repl-terminal-kill-line)
     map))
+
+
+;;; --- mode menu
+
+(easy-menu-define julia-snail-mode-menu julia-snail-mode-map
+  "Julia-Snail mode menu."
+  '("Snail"
+    ["Switch to REPL" julia-snail]
+    ["Activate package" julia-snail-package-activate]
+    ["Lookup documentation" julia-snail-doc-lookup]
+    ["Update module cache" julia-snail-update-module-cache]
+    "---"
+    ["Evaluate line" julia-snail-send-line]
+    ["Evaluate top-level form" julia-snail-send-top-level-form]
+    ["Evaluate region" julia-snail-send-region :active (region-active-p)]
+    ["Evaluate file" julia-snail-send-buffer-file]))
+
+(easy-menu-define julia-snail-repl-mode-menu julia-snail-repl-mode-map
+  "Julia-Snail REPL mode menu."
+  '("Snail REPL"
+    ["Switch to source" julia-snail-repl-go-back]))
 
 
 ;;; --- mode definitions
 
 ;;;###autoload
 (define-minor-mode julia-snail-mode
-  "A minor mode for interactive Julia development. Should only be turned on in source buffers.
+  "A minor mode for interactive Julia development.
+Should only be turned on in source buffers.
 
 The following keys are set:
 \\{julia-snail-mode-map}"
   :init-value nil
   :lighter (:eval (julia-snail--mode-lighter))
   :keymap julia-snail-mode-map
-  (when (eq 'julia-mode major-mode)
-    (if julia-snail-mode
-        ;; activate
-        (progn
-          (julia-snail--enable)
-          (add-hook 'xref-backend-functions #'julia-snail-xref-backend nil t)
-          (add-function :before-until (local 'eldoc-documentation-function) #'julia-snail-eldoc)
-          (advice-add 'spinner-print :around #'julia-snail--spinner-print-around)
-          (if (and (featurep 'company)
-                   julia-snail-company-doc-enable)
-              (add-hook 'completion-at-point-functions #'julia-snail-company-capf nil t)
-            (add-hook 'completion-at-point-functions #'julia-snail-repl-completion-at-point nil t)))
-      ;; deactivate
-      (if (and (featurep 'company)
-               julia-snail-company-doc-enable)
-          (remove-hook 'completion-at-point-functions #'julia-snail-company-capf t)
-        (remove-hook 'completion-at-point-functions #'julia-snail-repl-completion-at-point t))
-      (advice-remove 'spinner-print #'julia-snail--spinner-print-around)
-      (remove-function (local 'eldoc-documentation-function) #'julia-snail-eldoc)
-      (remove-hook 'xref-backend-functions #'julia-snail-xref-backend t)
-      (julia-snail--disable))))
+  (if julia-snail-mode
+      ;; activate
+      (progn
+        (julia-snail--enable)
+        (add-hook 'xref-backend-functions #'julia-snail-xref-backend nil t)
+        (add-function :before-until (local 'eldoc-documentation-function) #'julia-snail-eldoc)
+        (advice-add 'spinner-print :around #'julia-snail--spinner-print-around)
+        (setq julia-snail--imenu-fallback-index-function imenu-create-index-function)
+        (setq imenu-create-index-function 'julia-snail-imenu)
+        (if (and (or (locate-library "company-quickhelp")
+                     (locate-library "corfu-doc") ; deprecated; keeping around for backwards compatibility
+                     ;; TODO / FIXME: Implement a clean check for corfu-popupinfo, the Corfu documentation display system
+                     )
+                 julia-snail-completions-doc-enable)
+            (add-hook 'completion-at-point-functions #'julia-snail-completions-doc-capf nil t)
+          (add-hook 'completion-at-point-functions #'julia-snail-repl-completion-at-point nil t)))
+    ;; deactivate
+    (remove-hook 'completion-at-point-functions #'julia-snail-completions-doc-capf t)
+    (remove-hook 'completion-at-point-functions #'julia-snail-repl-completion-at-point t)
+    (setq imenu-create-index-function julia-snail--imenu-fallback-index-function)
+    (setq julia-snail--imenu-fallback-index-function nil)
+    (advice-remove 'spinner-print #'julia-snail--spinner-print-around)
+    (remove-function (local 'eldoc-documentation-function) #'julia-snail-eldoc)
+    (remove-hook 'xref-backend-functions #'julia-snail-xref-backend t)
+    (julia-snail--disable)))
 
 ;;;###autoload
 (define-minor-mode julia-snail-repl-mode
-  "A minor mode for interactive Julia development. Should only be
-turned on in REPL buffers."
+  "A minor mode for interactive Julia development.
+Should only be turned on in REPL buffers.
+
+The following keys are set:
+\\{julia-snail-repl-mode-map}"
   :init-value nil
   :lighter (:eval (julia-snail--mode-lighter))
   :keymap julia-snail-repl-mode-map
-  (when (eq 'vterm-mode major-mode)
+  (when (or (eq 'vterm-mode major-mode) (eq 'eat-mode major-mode))
     (if julia-snail-repl-mode
         (julia-snail--repl-enable)
       (julia-snail--repl-disable))))

@@ -145,7 +145,7 @@ struct Params
 end
 
 function format(obj, width, height)
-   if obj == nothing
+   if isnothing(obj)
       return ""
    end
    io = IOBuffer()
@@ -255,15 +255,12 @@ function eval_tmpfile(tmpfile, modpath, realfile, linenum,
    # linenum - 1 accounts for the leading "begin" line in tmpfiles
    expr_change_lnn(exprs, realfilesym, linenum - 1)
    result = eval_in_module(modpath, exprs)
-   if Conf.repl_display_eval_results && result != nothing
+   if Conf.repl_display_eval_results && !isnothing(result)
       println()
       @info "Module $modpath\n$result"
    end
-   # TODO: Returning the result of the expression can be really ugly if it's
-   # displayed in the minibuffer. There should be a nicer way to show it on
-   # the Emacs side (perhaps using overlays).
-   #Main.JuliaSnail.elexpr(result)
-   if popup_params == nothing
+   Base.MainInclude.ans = result # update the REPL's magic `ans` variable
+   if isnothing(popup_params)
       Main.JuliaSnail.elexpr(true)
    else
       Main.JuliaSnail.elexpr((
@@ -308,7 +305,7 @@ Return a name split into its module and identifier components.
 Example: given a string like "Base.Math.acos", return [Base.Math, "acos"].
 """
 function split_name(name::String, ns::Module=Main)
-   if match(r"\.", name) == nothing
+   if isnothing(match(r"\.", name))
       return [ns, name]
    end
    components = match(r"(.*?)\.(.*)", name)
@@ -435,7 +432,7 @@ function apropos(ns, pattern)
    names = lsnames(ns, all=true, imported=true, include_modules=false, recursive=true, pattern=pattern)
    # lazy load Base
    global apropos_cached_base
-   if apropos_cached_base == nothing
+   if isnothing(apropos_cached_base)
       apropos_cached_base = lsnames(Main.Base, all=false, imported=true, include_modules=true, recursive=true, prepend_ns=true)
    end
    base_filtered = filter(
@@ -444,7 +441,7 @@ function apropos(ns, pattern)
    append!(names, base_filtered)
    # lazy load Core
    global apropos_cached_core
-   if apropos_cached_core == nothing
+   if isnothing(apropos_cached_core)
       apropos_cached_core = lsnames(Main.Core, all=false, imported=true, include_modules=true, recursive=true, prepend_ns=true)
    end
    core_filtered = filter(
@@ -527,24 +524,28 @@ function pathat(cst, offset, pos = 0, path = [(expr=cst, start=1, stop=cst.span+
 end
 
 """
-Debugging helper: example code for traversing the CST.
+Debugging helper: example code for traversing the CST and tracking the location of each node.
 """
-function print_cst(cst, offset = 0)
-   for a in cst
-      if a.args === nothing
-         val = CSTParser.valof(a)
-         # Unicode byte fix
-         if String == typeof(val)
-            diff = sizeof(val) - length(val)
-            a.span -= diff
-            a.fullspan -= diff
+function print_cst(cst)
+   offset = 0
+   helper = (node) -> begin
+      for a in node
+         if a.args === nothing
+            val = CSTParser.valof(a)
+            # Unicode byte fix
+            if String == typeof(val)
+               diff = sizeof(val) - length(val)
+               a.span -= diff
+               a.fullspan -= diff
+            end
+            println(offset, ":", offset+a.span, "\t", val)
+            offset += a.fullspan
+         else
+            helper(a)
          end
-         println(offset, ":", offset+a.span, "\t", val)
-         offset += a.fullspan
-      else
-         offset = print_cst(a, offset)
       end
    end
+   helper(cst)
    return offset
 end
 
@@ -594,6 +595,85 @@ function blockat(encodedbuf, byteloc)
    return isnothing(description) ?
       nothing :
       [:list; tuple(modules...); start; stop; description]
+end
+
+"""
+Internal: assemble a human-readable function signature from a CSTParser node.
+"""
+function fnsig_helper(node)
+   fnsig = ""
+   reassemble = (n) -> begin
+      for x in n
+         if x.args === nothing
+            candidate = CSTParser.valof(CSTParser.get_name(x))
+            if candidate !== nothing && length(candidate) > 0
+               if "," == candidate
+                  candidate *= " "
+               end
+               fnsig *= candidate
+            end
+         else
+            reassemble(x)
+         end
+      end
+   end
+   reassemble(node)
+   return fnsig
+end
+
+"""
+For a given buffer, return the overall tree structure of the code.
+
+Result structure: [
+  [type name location extra]
+]
+where type is :function, :macro, etc.; when type is :module, then extra is a
+nested resulting structure.
+"""
+function codetree(encodedbuf)
+   cst = parse(encodedbuf)
+   offset = 1
+   helper = (node, depth = 1) -> begin
+      res = []
+      for a in node
+         if a.args === nothing
+            val = CSTParser.valof(a)
+            # XXX: We want bytes here because we convert back to position
+            # numbers on the Emacs side. So we do not apply the Unicode byte fix
+            # from print_cst.
+            offset += a.fullspan
+         else
+            curroffset = offset
+            aname = CSTParser.valof(CSTParser.get_name(a))
+            helper_res = helper(a, depth + 1)
+            if aname !== nothing
+               if CSTParser.defines_module(a)
+                  push!(res, (:module, aname, curroffset, helper_res))
+               elseif CSTParser.defines_function(a)
+                  fnsig = fnsig_helper(a.args[1])
+                  push!(res, (:function, fnsig, curroffset))
+               elseif CSTParser.defines_struct(a) || CSTParser.defines_mutable(a)
+                  push!(res, (:struct, aname, curroffset))
+               elseif CSTParser.defines_abstract(a) || CSTParser.defines_datatype(a) || CSTParser.defines_primitive(a)
+                  push!(res, (:type, aname, curroffset))
+               elseif CSTParser.defines_macro(a)
+                  push!(res, (:macro, aname, curroffset))
+               end
+            else
+               # XXX: Flatten on the fly. First, avoid empty entries. Second,
+               # use append! since only modules should generate nesting.
+               if length(helper_res) > 0
+                  append!(res, helper_res)
+               end
+            end
+         end
+      end
+      return res
+   end
+   tree = helper(cst)
+   return isempty(tree) ?
+      nothing :
+      [:list; tree]
 end
 
 """
@@ -736,6 +816,28 @@ end
 end
 
 
+### --- task handling code
+
+module Tasks
+
+import Printf
+
+active_tasks_lock = ReentrantLock()
+active_tasks = Dict{String, Task}()
+
+function interrupt(reqid)
+   if haskey(active_tasks, reqid)
+      task = active_tasks[reqid]
+      schedule(task, InterruptException(), error=true)
+      return [:list, true]
+   else
+      return [:list, false]
+   end
+end
+
+end
+
+
 ### --- server code
 
 running = false
@@ -787,40 +889,68 @@ function start(port=10011; addr="127.0.0.1")
       while running
          client = Sockets.accept(server_socket)
          push!(client_sockets, client)
-         @async while Sockets.isopen(client)
+         @async while Sockets.isopen(client) && !eof(client)
             command = readline(client, keep=true)
             input = nothing
+            expr = nothing
+            current_reqid = nothing
             try
                input = eval(Meta.parse(command))
                expr = Meta.parse(input.code)
-               result = eval_in_module(input.ns, expr)
-               # report successful evaluation back to client
+               current_reqid = input.reqid
+            catch err
+               # probably a parsing error
                resp = elexpr([
-                  Symbol("julia-snail--response-success"),
+                  Symbol("julia-snail--response-failure"),
                   input.reqid,
-                  result
+                  sprint(showerror, err),
+                  tuple(string.(stacktrace(catch_backtrace()))...)
                ])
                send_to_client(resp, client)
-            catch err
+               continue
+            end
+            active_task = @task begin # process input
                try
+                  result = eval_in_module(input.ns, expr)
+                  # report successful evaluation back to client
                   resp = elexpr([
-                     Symbol("julia-snail--response-failure"),
+                     Symbol("julia-snail--response-success"),
                      input.reqid,
-                     sprint(showerror, err),
-                     tuple(string.(stacktrace(catch_backtrace()))...)
+                     result
                   ])
                   send_to_client(resp, client)
-               catch err2
-                  if isa(err2, ArgumentError)
-                     println("JuliaSnail: ", err2.msg)
-                     # client connection was probably closed, clean it up
-                     deleteat!(client_sockets, findall(x -> x == client, client_sockets))
+               catch err
+                  if isa(err, InterruptException)
+                     resp = elexpr([
+                        Symbol("julia-snail--response-interrupt"),
+                        input.reqid
+                     ])
+                     send_to_client(resp, client)
                   else
-                     println("JuliaSnail: something broke: ", sprint(showerror, err2))
+                     try
+                        resp = elexpr([
+                           Symbol("julia-snail--response-failure"),
+                           input.reqid,
+                           sprint(showerror, err),
+                           tuple(string.(stacktrace(catch_backtrace()))...)
+                        ])
+                        send_to_client(resp, client)
+                     catch err2
+                        # internal Snail error or unexpected IO behavior..?
+                        println(stderr, "JuliaSnail: something broke in reqid: ", input.reqid, "; ", sprint(showerror, err2))
+                     end
                   end
-               end
+               finally
+                  lock(Tasks.active_tasks_lock) do
+                     delete!(Tasks.active_tasks, current_reqid)
+                  end
+               end # process input
             end
-         end
+            lock(Tasks.active_tasks_lock) do
+               Tasks.active_tasks[current_reqid] = active_task
+            end
+            schedule(active_task)
+         end # async while loop for client connection
       end
       close(server_socket)
    end
@@ -851,7 +981,7 @@ has multiple entries, send_to_client will prompt the user at the REPL to select
 which client should receive the message.
 """
 function send_to_client(expr, client_socket=nothing)
-   if client_socket == nothing
+   if isnothing(client_socket)
       if isempty(client_sockets)
          throw("No client connections available")
       elseif 1 == length(client_sockets)
@@ -873,6 +1003,9 @@ function send_to_client(expr, client_socket=nothing)
          # automatically if it is set. Clean up default_client_variable on
          # disconnect.
       end
+   end
+   if !isopen(client_socket)
+      throw("Something broke: client socket is already closed")
    end
    println(client_socket, expr)
 end

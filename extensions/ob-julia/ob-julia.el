@@ -53,6 +53,11 @@ your org notebook"
   :safe 'booleanp
   :type 'boolean)
 
+(defcustom julia-snail/ob-julia-resource-directory "./.ob-julia-snail/"
+  "Directory used to store automatically generated image files for display in org buffers."
+  :group 'julia-snail
+  :type 'string)
+
 (defvar julia-snail/ob-julia--point-inits (make-hash-table))
 (defvar julia-snail/ob-julia--point-finals (make-hash-table))
 
@@ -62,10 +67,11 @@ your org notebook"
 (defun julia-snail/ob-julia-evaluate (module _body src-file out-file)
   (let* (;;(filename (julia-snail--efn (buffer-file-name (buffer-base-buffer)))) ; commented out to make byte-compiler happy
          ;;(line-num 0)                                                          ; commented out to make byte-compiler happy
-         (text (format "JuliaSnail.Extensions.ObJulia.babel_run_and_store(%s, \"%s\", \"%s\", %s, %s, %s)"
+         (text (format "JuliaSnail.Extensions.ObJulia.babel_run_and_store(%s, \"%s\", \"%s\", \"%s\", %s, %s, %s)"
                        module
                        src-file
                        out-file
+                       julia-snail/ob-julia-resource-directory
                        (if julia-snail/ob-julia-use-error-pane "true" "false")
                        (if julia-snail/ob-julia-mirror-output-in-repl "true" "false")
                        (if julia-snail/ob-julia-capture-io "true" "false"))))
@@ -75,6 +81,10 @@ your org notebook"
     ;;   (progn
     ;;     (julia-snail) t))
     (julia-snail--send-to-server :Main text :async nil)))
+
+(defun julia-snail/ob-julia--maybe-goto-char (char)
+  (when char
+      (goto-char char)))
 
 ;; This function was adapted from ob-julia-vterm by Shigeaki Nishina (GPL-v3)
 ;; https://github.com/shg/ob-julia-vterm.el as of April 14, 2022
@@ -95,7 +105,7 @@ your org notebook"
                        "Output suppressed (line too long)"
                      bs)))))
       (puthash (current-thread) (copy-marker (point)) julia-snail/ob-julia--point-finals)
-      (goto-char (gethash (current-thread) julia-snail/ob-julia--point-inits))
+      (julia-snail/ob-julia--maybe-goto-char (gethash (current-thread) julia-snail/ob-julia--point-inits))
       out)))
 
 (defun julia-snail/ob-julia--in-julia-src-blockp ()
@@ -110,11 +120,11 @@ your org notebook"
            (puthash (current-thread) pt-init julia-snail/ob-julia--point-inits)
            (puthash (current-thread) pt-init julia-snail/ob-julia--point-finals)
            (let ((res (apply old arguments)))
-             (goto-char (gethash (current-thread) julia-snail/ob-julia--point-finals))
+             (julia-snail/ob-julia--maybe-goto-char (gethash (current-thread) julia-snail/ob-julia--point-finals))
              (remhash (current-thread) julia-snail/ob-julia--point-inits)
              (remhash (current-thread) julia-snail/ob-julia--point-finals)
              res))))
-    (apply old arguments)))
+  (apply old arguments)))
 
 
 ;; Deal with colour ANSI escape colour codes
@@ -141,9 +151,11 @@ your org notebook"
          (end (org-element-property :end context))
          (contents (buffer-substring beg end))
          (pt (- (point) beg))
+         (jsrb-save julia-snail-repl-buffer) ; julia-snail-repl-buffer is buffer local, so we need to preserve it!
          (inner-module (with-temp-buffer
-                         (insert contents)
-                         (julia-snail--cst-module-at (current-buffer) pt))))
+                         (let* ((julia-snail-repl-buffer jsrb-save))
+                           (insert contents)
+                           (julia-snail--cst-module-at (current-buffer) pt)))))
     (if inner-module
         (append src-module inner-module)
       src-module)))

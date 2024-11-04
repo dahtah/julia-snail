@@ -26,11 +26,20 @@ end
 """
 Format the argument.
 """
-function format_data(encodedstr::String)
+function format_data(encodedstr::String, pathstr::String)
    try
       str = String(Base64.base64decode(encodedstr))
-      JuliaFormatter.format_text(str)
-   catch # something broke, syntax probably invalid
+      path = String(Base64.base64decode(pathstr))
+      style = JuliaFormatter.find_config_file(path)
+      if isempty(style) # use default
+          JuliaFormatter.format_text(str)
+      else
+          opts = NamedTuple(zip(Symbol.(keys(style)), values(style)))
+          JuliaFormatter.format_text(str; opts...)
+      end
+   catch ex # something broke, syntax probably invalid
+      println()
+      @error ex
       return []
    end
 end
