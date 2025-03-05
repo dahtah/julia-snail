@@ -39,6 +39,7 @@ Refer to the [changelog](https://github.com/gcv/julia-snail/blob/master/CHANGELO
     - [REPL history](#repl-history)
     - [Formatter](#formatter)
     - [Ob-Julia](#ob-julia)
+    - [Debug](#debug)
 - [Future improvements](#future-improvements)
 <!-- markdown-toc end -->
 
@@ -355,7 +356,7 @@ end
 
 Everything in the files `alpha-1.jl` and `alpha-2.jl` is inside the `Alpha` module, but neither of these files will mention that module explicitly. Snail supports this by using the Julia parser to track `include(...)` calls and their module context. This feature works with nested modules.
 
-Using this feature requires some care. The root file which contains the module declaration (`alpha.jl` in this example) must be loaded using `julia-snail-send-buffer-file` first (or, for [Revise](https://github.com/timholy/Revise.jl) users, `julia-snail-update-module-cache`). If this does not happen, the parser will not have the opportunity to learn where `alpha-1.jl` and `alpha-2.jl` fit in the module hierarchy, and will assume their parent module is `Main`. The same applies to any deeper nesting of files (i.e., if `alpha-1.jl` then does `include("alpha-1.1.jl")`, then `julia-snail-send-buffer-file` or `julia-snail-update-module-cache` must be executed from `alpha-1.jl`).
+Using this feature requires some care. The root file which contains the module declaration (`alpha.jl` in this example) must be loaded using `julia-snail-send-buffer-file` first (or, for [Revise](https://github.com/timholy/Revise.jl) users, `julia-snail-update-module-cache`). Alternatively, you could run `julia-snail-analyze-includes`, which does not evaluate the code in the root file but analyzes and remembers the structure of `include` statements, and then you need to manually load the package of the root file with a normal `import` or `using` statement in the REPL. If this does not happen, the parser will not have the opportunity to learn where `alpha-1.jl` and `alpha-2.jl` fit in the module hierarchy, and will assume their parent module is `Main`. The same applies to any deeper nesting of files (i.e., if `alpha-1.jl` then does `include("alpha-1.1.jl")`, then `julia-snail-send-buffer-file` or `julia-snail-update-module-cache` must be executed from `alpha-1.jl`).
 
 Furthermore, if `alpha-1.jl` is refactored to sit outside the `Alpha` module, or moved in the directory structure, Snail must be informed. To do this, call the `julia-snail-clear-caches` command.
 
@@ -464,10 +465,24 @@ Customization variables:
 - `julia-snail/ob-julia-resource-directory "./.ob-julia-snail/"`: Directory used to store automatically generated image files for display in org buffers. By default this is a local hidden directory, but it can be changed to e.g. `/tmp/` if you don't want to keep the image files around.
 
 
+### Debug
+
+This extension uses [DebugAdapter.jl](https://github.com/julia-vscode/DebugAdapter.jl) and [dape](https://github.com/svaante/dape) to allow debugging inside the REPL.
+
+Use one of the following macros to initiate the debug session from the REPL:
+- `@run` pause on first breakpoint.
+- `@enter` pause on entry.
+
+```julia
+using .JuliaSnail.Extensions.Debug
+
+@enter(println("hello world"))
+```
+
+
 ## Future improvements
 
 -  The `libvterm` dependency forces the use of recent Emacs releases, forces Emacs to be build with module support, complicates support for Windows, and is generally quite gnarly. The Eat alternative requires Emacs 28. It would be much better to re-implement the REPL in Elisp and make sure it works on older Emacs versions.
 - Completion does not pick up local variables.
 - A real eldoc implementation would be great, but difficult to do with Julia’s generic functions.
-- A debugger would be great.
 - A real test suite which fully drives both Julia and Emacs and runs in a CI environment (like GitHub Actions) wouldn’t hurt, either.
